@@ -1,0 +1,12 @@
+:StrapsFork	straps-divergent.txt	/*:StrapsFork*
+fn.fork	straps-divergent.txt	/*fn.fork*
+fn.fork_section	straps-divergent.txt	/*fn.fork_section*
+fn.system_prompt_layer.divergent	straps-divergent.txt	/*fn.system_prompt_layer.divergent*
+straps-divergent	straps-divergent.txt	/*straps-divergent*
+straps-divergent-introduction	straps-divergent.txt	/*straps-divergent-introduction*
+straps-divergent-registry	straps-divergent.txt	/*straps-divergent-registry*
+straps-divergent-setup	straps-divergent.txt	/*straps-divergent-setup*
+straps-divergent-tests	straps-divergent.txt	/*straps-divergent-tests*
+straps-divergent-tool	straps-divergent.txt	/*straps-divergent-tool*
+straps-divergent.txt	straps-divergent.txt	/*straps-divergent.txt*
+tool.fork	straps-divergent.txt	/*tool.fork*

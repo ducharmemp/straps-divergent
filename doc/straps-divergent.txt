@@ -1,0 +1,140 @@
+*straps-divergent.txt*	Fork a straps.nvim session into a parallel session
+
+Author:  straps-divergent
+License: MIT
+
+==============================================================================
+CONTENTS					*straps-divergent*
+
+	1. Introduction ............... |straps-divergent-introduction|
+	2. Setup ...................... |straps-divergent-setup|
+	3. The fork tool .............. |straps-divergent-tool|
+	4. :StrapsFork ................ |:StrapsFork|
+	5. Registry entries ........... |straps-divergent-registry|
+	6. Tests ...................... |straps-divergent-tests|
+
+==============================================================================
+1. INTRODUCTION					*straps-divergent-introduction*
+
+A fork is a new straps session whose transcript is a verbatim copy of a
+source session's transcript, cut after a chosen block, with a
+`# You are a fork` section appended to the copied system block and one new
+user instruction at the end. The fork runs in parallel with the source.
+
+`spawn` (|straps-subagents|) starts a child with an empty context. `fork`
+starts a child that already holds this conversation: the files read, the
+findings, the decisions. Fork when the task needs that context and restating
+it would take more text than the task itself; spawn when a clean context
+serves the task better. Each request the fork makes resends the copied
+transcript as input tokens.
+
+==============================================================================
+2. SETUP					*straps-divergent-setup*
+
+>lua
+	require("straps").setup()
+	require("straps-divergent").setup()
+<
+`setup()` must run after straps' own `setup()`; it errors otherwise. The
+plugin's prompt section (`fn.system_prompt_layer.divergent`) registers after
+the straps layers, which keeps the prompt-cache prefix stable.
+
+==============================================================================
+3. THE FORK TOOL				*straps-divergent-tool* *tool.fork*
+
+fork{ task, upto?, show?, max_turns?, timeout_ms?, model?, effort? }
+
+The agent calls it from a running session. The tool:
+
+1. Copies the transcript up to the current point, or up to block `upto`
+   (block numbers as `transcript_excise` lists them; 2 or more, since block
+   1 is the system block), into a new session.
+2. Appends `fn.fork_section`'s `# You are a fork` text to the copied system
+   block. The section names the source buffer and the cut point, explains
+   the synthetic results below, and restates the subagent contract (the
+   parent sees only the final reply; no `ask_user`; report blockers with
+   `send_message{to="parent"}`).
+3. Pairs the trailing run of tool calls that have no result yet: the fork
+   call itself gets a success result; every other one gets an error result
+   marked "not run in this fork". The loop appends every tool_use marker of
+   a batch before running any, so without `upto` that run is the fork call
+   and the calls after it in the same turn. With `upto`, the fork call is
+   claimed only when every block past the cut is a tool block of that same
+   batch; a cut inside an earlier turn claims nothing. An unpaired call
+   with conversation after it is left alone, as |:StrapsResume|'s repair
+   leaves it.
+4. Appends `task` as the fork's instruction and starts the run.
+
+The fork is a subagent of the source: `spawn_wait{ buffers = { N } }`
+collects its final reply, the completion notice
+(|hook.on_run_end.notify_parent|) arrives when it ends, |:StrapsStop| on the
+source stops it, and it counts against `config.max_spawn_depth` (the tool
+stays listed at the limit and refuses there). It copies the source's
+permission grants wholesale, including a gated parent's ceiling and any
+|:StrapsAuto| grants (`spawn` passes only its `allow` list on), plus its
+tool filter, provider, model and effort; `model` and `effort` override the
+inherited values. Its registry scope chains under the source, so the
+source's session-scoped entries resolve. It loses `ask_user`, as every
+subagent does.
+
+`tool.fork` carries `capability = "spawn"`, so the `spawn` grant
+(|straps-auto|) covers it.
+
+==============================================================================
+4. :StrapsFork					*:StrapsFork*
+
+:[vertical|tab] StrapsFork[!] [upto] [-- instruction]
+
+Fork the current session by hand. Run it on an idle session buffer; it
+refuses while a run is active (|:StrapsStop| first). It copies the
+transcript up to block `upto` (default: all), appends the instruction as the
+trailing user block, opens the fork in a split (`:vertical` for a vsplit,
+`:tab` for a tabpage, `:botright` and the other placement modifiers as for
+|:Straps|) and starts its run. Without `!` and without `-- instruction`, it
+prompts for one. With `!`, the fork opens idle with the instruction (if any)
+in place, so you can edit it before pressing <CR>.
+
+A command fork is a peer: it has no parent, nothing notifies the source when
+it ends, |:StrapsStop| on the source leaves it running, `ask_user` stays
+available, it keeps the source's turn cap, and the agents buffer lists it
+without a parent. Its `# You are a fork` section says the user forked the
+session and remains the correspondent. Grants, tool filter, scoped entries
+and model settings are copied as for the tool.
+
+==============================================================================
+5. REGISTRY ENTRIES				*straps-divergent-registry*
+
+All four are registered with `define_default`, so a redefinition survives a
+second `setup()`.
+
+						*fn.fork*
+fn.fork(source, opts) -> bufnr
+		The copy mechanism. `opts`: `task`, `upto`, `relation`
+		("child" | "peer"), `start` (false leaves the fork idle),
+		`split` (a split command; the fork opens with it), `focus`
+		(false restores the previous window), `max_turns` (a child
+		defaults to 24, a peer inherits the source's cap),
+		`timeout_ms`, `provider`, `model`, `effort`.
+
+						*fn.fork_section*
+fn.fork_section(source, child, upto, { relation, depth }) -> string
+		The `# You are a fork` text. Redefine it to change the
+		wording. Lines that read as transcript markers are escaped
+		on insertion.
+
+						*fn.system_prompt_layer.divergent*
+fn.system_prompt_layer.divergent()
+		The `# Forking` section of the system prompt.
+
+==============================================================================
+6. TESTS					*straps-divergent-tests*
+
+>sh
+	STRAPS_DIR=/path/to/straps busted tests/fork_spec.lua
+	STRAPS_DIR=/path/to/straps busted tests/setup_order_spec.lua
+<
+Without `STRAPS_DIR` the specs look for a straps checkout at `../straps`.
+Run one busted process per spec. `nix flake check` runs every spec against
+the straps input recorded in `flake.lock`.
+
+vim:tw=78:ts=8:noet:ft=help:norl:
