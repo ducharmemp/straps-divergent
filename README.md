@@ -26,7 +26,18 @@ With lazy.nvim:
 
 `require("straps-divergent").setup()` must run after `require("straps").setup()`. It errors otherwise, because its prompt section registers after the straps layers and keeps the prompt cache prefix stable.
 
-With Nix, the flake exports `packages.<system>.default` and an overlay that adds `vimPlugins.straps-divergent`; it takes straps as a flake input.
+With Nix, the flake exports `packages.<system>.default`, an overlay that adds `vimPlugins.straps-divergent`, and a nixvim module; it takes straps as a flake input. Import the module next to the straps module:
+
+```nix
+imports = [
+  straps.nixvimModules.default
+  straps-divergent.nixvimModules.default
+];
+plugins.straps.enable = true;
+plugins.straps-divergent.enable = true;
+```
+
+The module emits its `setup()` call with `lib.mkAfter`, so it runs after straps' `setup()`.
 
 ## The `fork` tool
 

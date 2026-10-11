@@ -39,6 +39,18 @@ transcript as input tokens.
 plugin's prompt section (`fn.system_prompt_layer.divergent`) registers after
 the straps layers, which keeps the prompt-cache prefix stable.
 
+With nixvim, import the flake's module next to the straps module:
+>nix
+	imports = [
+	  straps.nixvimModules.default
+	  straps-divergent.nixvimModules.default
+	];
+	plugins.straps.enable = true;
+	plugins.straps-divergent.enable = true;
+<
+The module emits its `setup()` call with `lib.mkAfter`, so it runs after
+straps' `setup()`.
+
 ==============================================================================
 3. THE FORK TOOL				*straps-divergent-tool* *tool.fork*
 

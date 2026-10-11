@@ -35,6 +35,31 @@
         vimPlugins = prev.vimPlugins // { straps-divergent = mkPlugin final; };
       };
 
+      nixvimModules = rec {
+        straps-divergent = { lib, config, pkgs, ... }:
+          let
+            cfg = config.plugins.straps-divergent;
+          in
+          {
+            options.plugins.straps-divergent = {
+              enable = lib.mkEnableOption "straps-divergent, the straps.nvim session fork tool";
+              package = lib.mkOption {
+                type = lib.types.package;
+                default = mkPlugin pkgs;
+                defaultText = lib.literalExpression ''straps-divergent.packages.''${system}.default'';
+                description = "The straps-divergent plugin package.";
+              };
+            };
+            config = lib.mkIf cfg.enable {
+              extraPlugins = [ cfg.package ];
+              extraConfigLua = lib.mkAfter ''
+                require("straps-divergent").setup()
+              '';
+            };
+          };
+        default = straps-divergent;
+      };
+
       checks = forAllSystems (pkgs: {
         tests = pkgs.stdenvNoCC.mkDerivation {
           name = "straps-divergent-tests";
