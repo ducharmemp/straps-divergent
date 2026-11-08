@@ -4,7 +4,7 @@ This repo is a plugin for straps.nvim. It adds a `fork` tool and a `:StrapsFork`
 
 ## Conventions
 
-- Do not vendor straps. Tests locate it through `$STRAPS_DIR` or `../straps`.
+- Do not vendor straps. Tests locate it through `$STRAPS_ROOT` or `../straps`.
 - Call `require("straps-divergent").setup()` after `require("straps").setup()`. `register()` enforces that order.
 - Keep `README.md` and `doc/straps-divergent.txt` consistent with behavior changes.
 - Version control is jujutsu (`jj`). Create no commits unless asked.
@@ -14,8 +14,8 @@ This repo is a plugin for straps.nvim. It adds a `fork` tool and a `:StrapsFork`
 Each `tests/*_spec.lua` is a self-contained busted spec run by `nlua` inside a headless Neovim. Run one busted process per spec:
 
 ```sh
-STRAPS_DIR=/path/to/straps busted tests/fork_spec.lua
-STRAPS_DIR=/path/to/straps busted tests/setup_order_spec.lua
+STRAPS_ROOT=/path/to/straps busted tests/fork_spec.lua
+STRAPS_ROOT=/path/to/straps busted tests/setup_order_spec.lua
 ```
 
 `nix flake check` runs every spec against the straps input recorded in `flake.lock`.

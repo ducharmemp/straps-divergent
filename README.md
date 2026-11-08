@@ -24,7 +24,7 @@ With lazy.nvim:
 }
 ```
 
-`require("straps-divergent").setup()` must run after `require("straps").setup()`. It errors otherwise, because its prompt section registers after the straps layers and keeps the prompt cache prefix stable.
+`require("straps-divergent").setup()` must run after `require("straps").setup()`. `setup()` takes no options and warns when given a non-empty table. It errors when straps is not set up, because its prompt section registers after the straps layers and keeps the prompt cache prefix stable.
 
 With Nix, the flake exports `packages.<system>.default`, an overlay that adds `vimPlugins.straps-divergent`, and a nixvim module; it takes straps as a flake input. Import the module next to the straps module:
 
@@ -48,17 +48,17 @@ The agent calls `fork{ task = "..." }`. The tool:
 3. Pairs the trailing run of tool calls that have no result yet (the fork call itself and any call issued after it in the same turn): the fork call gets a success result; every other one gets an error result marked "not run in this fork". With `upto` set, the fork call is claimed only when every block past the cut is a tool block of the same batch; a cut inside an earlier turn claims nothing.
 4. Appends `task` as the fork's instruction and starts its run.
 
-The fork is a subagent of the source: `spawn_wait{ buffers = { N } }` collects its final reply, a `[straps]` notice arrives when it finishes, `:StrapsStop` on the source stops it, and it counts against `config.max_spawn_depth` (the tool stays listed at the limit and refuses there). It copies the source's permission grants wholesale (including `:StrapsAuto` grants, which `spawn` does not pass on), its tool filter, provider, model and effort, and resolves the source's session-scoped registry entries. It loses `ask_user`, as every subagent does.
+The fork is a subagent of the source: `spawn_wait{ buffers = { N } }` collects its final reply, a `[straps]` notice arrives when it finishes, `:StrapsStop` on the source stops it, and it counts against `config.max_spawn_depth` (the tool stays listed at the limit and refuses there). Without `allow` or `readonly`, it copies the source's permission grants wholesale (including `:StrapsAuto` grants, which `spawn` does not pass on). With `readonly = true` or `allow = { ... }`, it gets only those grants, with `spawn`'s meaning: granted calls run without a prompt, read-only calls pass, and every other call is denied. The two are mutually exclusive, and a gated source can grant only a subset of its own grants. It also copies the source's tool filter, provider, model and effort, and resolves the source's session-scoped registry entries. It loses `ask_user`, as every subagent does.
 
-Parameters: `task` (required), `upto` (a block number as `transcript_excise` lists them, 2 or more), `show`, `max_turns` (default 24), `timeout_ms` (default 600000), `model`, `effort`.
+Parameters: `task` (required), `upto` (a block number as `transcript_excise` lists them, 2 or more), `show`, `max_turns` (default 24), `timeout_ms` (default 600000), `model`, `effort`, `readonly`, `allow`. With `upto`, the fork call is claimed only when every block past the cut is a tool block of that call's batch; otherwise every unpaired call in the copy gets a "not run in this fork" result.
 
 ## `:StrapsFork`
 
 ```
-:[vertical] StrapsFork[!] [upto] [-- instruction]
+:[vertical|tab] StrapsFork[!] [upto] [-- instruction]
 ```
 
-Run it on an idle session buffer. It copies the transcript (up to block `upto`), appends the instruction, opens the fork in a split (`:vertical` for a vsplit, `:tab` for a tabpage) and starts its run. Without `!` and without `-- instruction`, it prompts for one. With `!`, the fork opens idle, so you can edit it before `<CR>`.
+Run it on an idle session buffer. It copies the transcript (up to block `upto`), appends the instruction, opens the fork in a split (`:vertical` for a vsplit, `:tab` for a tabpage) and starts its run. Without `!` and without `-- instruction`, it prompts for one. With `!`, the fork opens idle, so you can edit it before `<CR>`. On success it notifies `straps-divergent: forked into buffer N`.
 
 A command fork is a peer: it has no parent, nothing notifies the source when it ends, `:StrapsStop` on the source leaves it running, `ask_user` stays available, and it keeps the source's turn cap. Grants, tool filter, scoped entries and model settings are copied as for the tool. The command refuses while the source has a run active; `:StrapsStop` it first.
 
@@ -76,7 +76,9 @@ Every entry is registered with `define_default`, so a redefinition survives a se
 ## Tests
 
 ```sh
-STRAPS_DIR=/path/to/straps busted tests/fork_spec.lua
+STRAPS_ROOT=/path/to/straps busted tests/fork_spec.lua
 ```
 
-Without `STRAPS_DIR`, the specs look for a straps checkout at `../straps`. Run one busted process per spec; `nix flake check` does that against the straps input recorded in `flake.lock`.
+`STRAPS_DIR` remains a compatibility fallback. `:checkhealth straps-divergent` reports setup and registration without forking.
+
+Without `STRAPS_ROOT` or `STRAPS_DIR`, the specs look for a straps checkout at `../straps`. Run one busted process per spec; `nix flake check` does that against the straps input recorded in `flake.lock`.

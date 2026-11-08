@@ -140,23 +140,25 @@ return function(source, opts)
     if cap then vim.b[child].straps_max_turns = math.floor(cap) end
   end
   do
-    local filter, pp, pm, pom, pe
+    local filter, pp, pe
     pcall(function()
       filter = vim.b[source].straps_tool_filter
       pp = vim.b[source].straps_provider
-      pm = vim.b[source].straps_model
-      pom = vim.b[source].straps_openai_model
       pe = vim.b[source].straps_effort
     end)
     if type(filter) == "table" and #filter > 0 then
       vim.b[child].straps_tool_filter = filter
     end
     local provider = opts.provider or pp
-    local model = opts.model or ((provider == "openai") and pom or pm)
+    local model_var = require("straps.provider").provider_slot(provider).buf_model_var
+    local model = opts.model
+    if model == nil then
+      pcall(function() model = vim.b[source][model_var] end)
+    end
     local effort = opts.effort or pe
     if type(provider) == "string" and provider ~= "" then vim.b[child].straps_provider = provider end
     if type(model) == "string" and model ~= "" then
-      if provider == "openai" then vim.b[child].straps_openai_model = model else vim.b[child].straps_model = model end
+      vim.b[child][model_var] = model
     end
     if type(effort) == "string" and effort ~= "" then vim.b[child].straps_effort = effort end
   end
@@ -167,8 +169,29 @@ return function(source, opts)
     vim.b[child].straps_spawn_timeout_ms = tonumber(opts.timeout_ms) or 600000
     vim.b[child].straps_spawn_started_ms = vim.uv.now()
   end
-  for key in pairs(registry.granted(source)) do
-    registry.grant(child, key)
+  if opts.readonly or type(opts.allow) == "table" then
+    local grantable = registry.try_call("fn.capability") or {}
+    local is_grantable = {}
+    for _, c in ipairs(grantable) do is_grantable[c] = true end
+    for _, entry in ipairs(type(opts.allow) == "table" and opts.allow or {}) do
+      if is_grantable[entry] then
+        registry.grant(child, "cap:" .. entry)
+      else
+        registry.grant(child, registry.tool_grant_key(entry))
+      end
+    end
+    registry.grant(child, "spawn:gated")
+    registry.define({
+      name = "hook.confirm",
+      kind = "hook",
+      doc = "fork: readonly/allow child — auto-allow read-only calls plus the"
+        .. " granted categories/tools, deny everything else without a prompt.",
+      source = require("straps-divergent").GATED_CONFIRM_SRC,
+    }, { scope = child })
+  else
+    for key in pairs(registry.granted(source)) do
+      registry.grant(child, key)
+    end
   end
 
   if type(opts.split) == "string" and opts.split ~= "" then
@@ -186,6 +209,37 @@ return function(source, opts)
     loop.start(child)
   end
   return child
+end
+]==]
+
+M.GATED_CONFIRM_SRC = [==[
+return function(name, tin, tctx)
+  local reg = require("straps.registry")
+  local cap = reg.try_call("fn.capability", name, tin)
+  if cap == "read" then return true end
+  local allowed
+  pcall(function()
+    allowed = tctx and tctx.bufnr and reg.granted(tctx.bufnr) or nil
+  end)
+  if type(allowed) == "table" then
+    if cap and allowed["cap:" .. tostring(cap)] then return true end
+    if allowed[reg.tool_grant_key(name)] then return true end
+  end
+  if name == "send_message" and type(tin) == "table" and tin.to == "parent" then
+    return true
+  end
+  local names = {}
+  if type(allowed) == "table" then
+    for k in pairs(allowed) do
+      if k ~= "spawn:gated" then names[#names + 1] = k end
+    end
+  end
+  if #names == 0 then
+    return false, "readonly subagent: " .. tostring(name) .. " is not allowed"
+  end
+  table.sort(names)
+  return false, "subagent: " .. tostring(name) .. " is not covered by this child's grants ("
+    .. table.concat(names, ", ") .. ")"
 end
 ]==]
 
@@ -230,6 +284,50 @@ return function(input, ctx)
     error("fork: task must be a non-empty string", 0)
   end
   local registry = require("straps.registry")
+  if input.readonly and type(input.allow) == "table" then
+    error("fork: readonly and allow are mutually exclusive (readonly is allow={})", 0)
+  end
+  if input.allow ~= nil and type(input.allow) ~= "table" then
+    error("fork: allow must be an array of categories or tool names", 0)
+  end
+  if type(input.allow) == "table" then
+    local parent_grants = registry.granted(ctx.bufnr)
+    local gated = parent_grants["spawn:gated"] == true
+    local grantable = registry.try_call("fn.capability") or {}
+    local is_grantable = {}
+    for _, c in ipairs(grantable) do is_grantable[c] = true end
+    for _, entry in ipairs(input.allow) do
+      if not (is_grantable[entry] or registry.get("tool." .. tostring(entry)) ~= nil) then
+        error("fork: allow entry " .. vim.inspect(entry)
+          .. " is not a grantable category (" .. table.concat(grantable, ", ")
+          .. ") or an existing tool", 0)
+      end
+      if registry.try_call("fn.capability", entry) == "define" then
+        error("fork: allow entry " .. vim.inspect(entry)
+          .. " is in the define category, which is never grantable", 0)
+      end
+      if gated then
+        local within
+        if is_grantable[entry] then
+          within = parent_grants["cap:" .. entry] == true
+        else
+          local cap = registry.try_call("fn.capability", entry)
+          if cap == "read" then cap = registry.try_call("fn.capability", entry, { index = 1 }) end
+          within = cap == "read" or parent_grants[registry.tool_grant_key(entry)] == true
+            or (type(cap) == "string" and parent_grants["cap:" .. cap] == true)
+        end
+        if not within then
+          local held = {}
+          for k in pairs(parent_grants) do
+            if k ~= "spawn:gated" then held[#held + 1] = k end
+          end
+          table.sort(held)
+          error("fork: allow entry " .. vim.inspect(entry)
+            .. " exceeds this session's own grants (" .. table.concat(held, ", ") .. ")", 0)
+        end
+      end
+    end
+  end
   local depth = 0
   pcall(function() depth = tonumber(vim.b[ctx.bufnr].straps_spawn_depth) or 0 end)
   local max_depth = registry.try_call("fn.spawn_depth_limit") or 1
@@ -245,6 +343,8 @@ return function(input, ctx)
     timeout_ms = input.timeout_ms,
     model = input.model,
     effort = input.effort,
+    readonly = input.readonly and true or nil,
+    allow = input.allow,
     split = input.show and "botright vsplit" or nil,
     focus = false,
   })
@@ -296,7 +396,7 @@ local function parse_fork_args(args)
   local upto
   for tok in head:gmatch("%S+") do
     if upto ~= nil or not tok:match("^%d+$") then
-      return nil, nil, "usage: :StrapsFork[!] [upto] [-- instruction]"
+      return nil, nil, "usage: :[vertical|tab] StrapsFork[!] [upto] [-- instruction]"
     end
     upto = tonumber(tok)
   end
@@ -334,8 +434,10 @@ local function fork_command(opts)
       split = split_cmd_of(opts.smods),
     })
     if not ok then
-      vim.notify("straps-divergent: " .. tostring(res), vim.log.levels.ERROR)
+      vim.notify("straps-divergent: " .. tostring(res):gsub("^fn%.fork: ", ""), vim.log.levels.ERROR)
+      return
     end
+    vim.notify(("straps-divergent: forked into buffer %d"):format(res), vim.log.levels.INFO)
   end
   if instruction or opts.bang then
     go(instruction)
@@ -364,8 +466,9 @@ function M.register()
       .. " to the copied system block, a tool_result for every unpaired tool_use in the"
       .. " copy, and opts.task as the trailing user block. opts.relation 'child'"
       .. " (default) sets straps_parent so the source collects the reply with"
-      .. " spawn_wait; 'peer' leaves the fork independent. Copies the source's grants,"
-      .. " tool filter and provider/model/effort (opts.provider/model/effort override),"
+      .. " spawn_wait; 'peer' leaves the fork independent. Copies the source's grants"
+      .. " unless opts.readonly or opts.allow (a validated grant list) gates the fork,"
+      .. " plus its tool filter and provider/model/effort (opts.provider/model/effort override),"
       .. " and chains the fork's registry scope under the source. opts.start = false"
       .. " leaves the fork idle; opts.split opens it with that split command (focus ="
       .. " false restores the previous window); max_turns, timeout_ms as for spawn.",
@@ -395,25 +498,38 @@ function M.register()
       .. " knows, so the task can refer to files, findings and decisions above without"
       .. " restating them. Returns at once with the fork's buffer handle; collect its"
       .. " final reply with spawn_wait, exactly as for spawn, and a [straps] notice"
-      .. " arrives when it finishes. The fork holds this session's permissions and"
-      .. " session-scoped tools, counts against the subagent depth limit, and loses"
-      .. " ask_user (the parent is its correspondent). Tool calls issued after the fork"
-      .. " call in this turn run only here; the fork sees them as 'not run in this"
-      .. " fork'. Parameters: task (required); upto (optional): a block number from"
-      .. " transcript_excise's listing, the fork sees blocks 1..upto (2 or more; 1 is the"
-      .. " system block); show (optional): open the fork's transcript in a split;"
-      .. " max_turns (default 24); timeout_ms (default 600000, enforced by spawn_wait);"
-      .. " model, effort (optional): override the inherited model/effort.",
+      .. " arrives when it finishes. Without allow/readonly the fork holds this session's"
+      .. " permission grants and session-scoped tools; it counts against the subagent"
+      .. " depth limit and loses ask_user (the parent is its correspondent). Tool calls"
+      .. " issued after the fork call in this turn run only here; the fork sees them as"
+      .. " 'not run in this fork'. Parameters: task (required); upto (optional): a block"
+      .. " number from transcript_excise's listing, the fork sees blocks 1..upto (2 or"
+      .. " more; 1 is the system block); with upto, this fork call is marked as the fork"
+      .. " only when every block past the cut is a tool block of this call's batch,"
+      .. " otherwise every unpaired call in the copy is marked 'not run in this fork';"
+      .. " show (optional): open the fork's transcript in a split; max_turns (default"
+      .. " 24); timeout_ms (default 600000, enforced by spawn_wait); model, effort"
+      .. " (optional): override the inherited model/effort; readonly (optional boolean):"
+      .. " the fork may use only read-only tools, every write is denied without a prompt"
+      .. " (equivalent to allow={}); allow (optional array): grant only these permission"
+      .. " categories or tool names, everything else is denied; readonly and allow are"
+      .. " mutually exclusive, and a gated session can grant only a subset of its own grants.",
     input_schema = {
       type = "object",
       properties = {
         task = { type = "string", description = "The fork's instruction; it may refer to anything in this conversation." },
-        upto = { type = "integer", description = "Copy blocks 1..upto only (block numbers as transcript_excise lists them); default: the whole transcript." },
+        upto = { type = "integer", minimum = 2, description = "Copy blocks 1..upto only (block numbers as transcript_excise lists them; 2 or more); default: the whole transcript." },
         show = { type = "boolean", description = "Open the fork's transcript buffer in a split." },
         max_turns = { type = "integer", description = "Fork turn budget (default 24)." },
         timeout_ms = { type = "integer", description = "Wall-clock cap in milliseconds (default 600000), enforced by spawn_wait." },
         model = { type = "string", description = "Model id for the fork (default: this session's model)." },
         effort = { type = "string", description = "Extended-thinking effort name for the fork (default: this session's effort)." },
+        readonly = { type = "boolean", description = "Read-only fork: every write tool is denied. Default: the fork copies this session's grants." },
+        allow = {
+          type = "array",
+          items = { type = "string" },
+          description = "Grant only these permission categories (edit, delete, exec, lua, net, spawn) or tool names to the fork: granted calls run without prompting; everything else is DENIED. readonly=true is equivalent to allow={}.",
+        },
       },
       required = { "task" },
     },
@@ -433,11 +549,15 @@ function M.register()
     bang = true,
     desc = "straps-divergent: fork this session into a new peer session"
       .. " ([upto] cuts the copy; `-- text` is the instruction; ! leaves it idle;"
-      .. " :vertical for a vsplit)",
+      .. " :vertical for a vsplit, :tab for a tabpage)",
   })
 end
 
-function M.setup()
+function M.setup(opts)
+  assert(opts == nil or type(opts) == "table", "straps-divergent: setup options must be a table")
+  if type(opts) == "table" and next(opts) ~= nil then
+    vim.notify("straps-divergent: setup() takes no options; ignoring them", vim.log.levels.WARN)
+  end
   M.register()
   return M
 end

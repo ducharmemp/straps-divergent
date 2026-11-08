@@ -6,9 +6,9 @@
 
 local script = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(vim.fn.fnamemodify(script, ":p"), ":h:h")
-local straps_dir = vim.env.STRAPS_DIR or vim.fn.fnamemodify(root, ":h") .. "/straps"
+local straps_dir = vim.env.STRAPS_ROOT or vim.env.STRAPS_DIR or vim.fn.fnamemodify(root, ":h") .. "/straps"
 assert(vim.fn.isdirectory(straps_dir .. "/lua/straps") == 1,
-  "straps checkout not found at " .. straps_dir .. " (set STRAPS_DIR)")
+  "straps checkout not found at " .. straps_dir .. " (set STRAPS_ROOT)")
 vim.opt.runtimepath:prepend(straps_dir)
 vim.opt.runtimepath:prepend(root)
 package.path = straps_dir .. "/lua/?.lua;" .. straps_dir .. "/lua/?/init.lua;"
@@ -302,6 +302,42 @@ it("a child fork is shaped like a spawn child; a peer is independent", function(
   assert(not psys:find("The source session is your parent", 1, true), "no child text in a peer")
 end)
 
+it("a fork copies the model from the provider's own buffer variable", function()
+  local s = state.new_session()
+  state.append_text(s, "go")
+  vim.b[s].straps_provider = "llamacpp"
+  vim.b[s].straps_llamacpp_model = "local-model"
+  vim.b[s].straps_model = "anthropic-model"
+  local c = registry.call("fn.fork", s, { relation = "child", task = "t", start = false })
+  assert(vim.b[c].straps_provider == "llamacpp")
+  assert(vim.b[c].straps_llamacpp_model == "local-model", "llamacpp model copied: " .. tostring(vim.b[c].straps_llamacpp_model))
+  assert(vim.b[c].straps_model == nil, "the anthropic slot is not written for a llamacpp fork")
+  local o = registry.call("fn.fork", s, { relation = "child", task = "t", start = false, model = "override" })
+  assert(vim.b[o].straps_llamacpp_model == "override", "an explicit model lands in the llamacpp slot")
+end)
+
+it("tool.fork declares upto minimum 2", function()
+  assert(registry.get("tool.fork").input_schema.properties.upto.minimum == 2)
+  assert(registry.get("tool.fork").input_schema.properties.allow.type == "array")
+  assert(registry.get("tool.fork").input_schema.properties.readonly.type == "boolean")
+end)
+
+it("setup warns on a non-empty options table", function()
+  local real_notify = vim.notify
+  local notes = {}
+  vim.notify = function(msg, level) notes[#notes + 1] = { msg = msg, level = level } end
+  local ok, err = pcall(function()
+    require("straps-divergent").setup({ foo = 1 })
+    require("straps-divergent").setup({})
+    require("straps-divergent").setup()
+  end)
+  vim.notify = real_notify
+  assert(ok, err)
+  assert(#notes == 1, "exactly one warning, got " .. #notes)
+  assert(notes[1].msg == "straps-divergent: setup() takes no options; ignoring them", notes[1].msg)
+  assert(notes[1].level == vim.log.levels.WARN)
+end)
+
 it("the section says spawn and fork are unavailable only at the depth limit", function()
   local saved = straps.config.max_spawn_depth
   straps.config.max_spawn_depth = 2
@@ -396,6 +432,67 @@ it("tool.fork starts a child that spawn_wait collects", function()
     if vim.api.nvim_win_get_buf(w) == child then shown = true; vim.api.nvim_win_close(w, true) end
   end
   assert(shown, "show=true should open the fork in a window")
+end)
+
+it("tool.fork with allow or readonly gates the fork instead of copying grants", function()
+  provider(FORK_AWARE_PROVIDER)
+  local parent = state.new_session()
+  state.append_text(parent, "go")
+  registry.grant(parent, "cap:exec")
+  registry.grant(parent, "cap:edit")
+  local function fork_with(input)
+    return drive(function(ctx)
+      ctx.bufnr = parent
+      local out = registry.call("tool.fork", input, ctx)
+      local child = tonumber(out:match("buffer (%d+)"))
+      pcall(loop.stop, child)
+      return child
+    end)
+  end
+  local c = fork_with({ task = "a", allow = { "edit" } })
+  wait_idle(c)
+  local g = registry.granted(c)
+  assert(g["cap:edit"] == true and g["spawn:gated"] == true, "allow grants edit and gates")
+  assert(g["cap:exec"] == nil, "grants outside allow are not copied")
+  local prev = registry.set_active_scope(c)
+  local allowed = registry.call("hook.confirm", "bash", { command = "true" }, { bufnr = c })
+  local edit_ok = registry.call("hook.confirm", "write_file", { path = "/tmp/x", content = "" }, { bufnr = c })
+  registry.set_active_scope(prev)
+  assert(allowed == false, "exec is denied in an allow={edit} fork")
+  assert(edit_ok == true, "edit is allowed in an allow={edit} fork")
+
+  local r = fork_with({ task = "b", readonly = true })
+  wait_idle(r)
+  assert(registry.granted(r)["cap:exec"] == nil and registry.granted(r)["spawn:gated"] == true, "readonly copies nothing")
+  prev = registry.set_active_scope(r)
+  local w, reason = registry.call("hook.confirm", "write_file", { path = "/tmp/x", content = "" }, { bufnr = r })
+  local read_ok = registry.call("hook.confirm", "read_file", { path = "/tmp/x" }, { bufnr = r })
+  registry.set_active_scope(prev)
+  assert(read_ok == true, "a readonly fork may read")
+  assert(w == false and tostring(reason):find("readonly subagent", 1, true), tostring(reason))
+
+  local d = fork_with({ task = "c" })
+  wait_idle(d)
+  assert(registry.granted(d)["cap:exec"] == true, "without allow/readonly the grants are copied")
+
+  for _, case in ipairs({
+    { { task = "x", readonly = true, allow = {} }, "mutually exclusive" },
+    { { task = "x", allow = "edit" }, "allow must be an array" },
+    { { task = "x", allow = { "nope" } }, "is not a grantable category" },
+    { { task = "x", allow = { "registry_define" } }, "define category" },
+  }) do
+    local ok, err = pcall(drive, function(ctx)
+      ctx.bufnr = parent
+      return registry.call("tool.fork", case[1], ctx)
+    end)
+    assert(not ok and tostring(err):find(case[2], 1, true), case[2] .. ": " .. tostring(err))
+  end
+  registry.grant(r, "cap:edit")
+  local ok, err = pcall(drive, function(ctx)
+    ctx.bufnr = r
+    return registry.call("tool.fork", { task = "x", allow = { "exec" } }, ctx)
+  end)
+  assert(not ok and tostring(err):find("exceeds this session's own grants", 1, true), tostring(err))
 end)
 
 it("an upto cut never claims a fork call, and a mid-transcript orphan is left alone", function()
@@ -584,6 +681,8 @@ it(":StrapsFork! leaves the fork idle, honors upto and :vertical", function()
   f = fork_bufs_since(before)[1]
   assert(f and #vim.api.nvim_list_tabpages() == tabs_before + 1, ":tab StrapsFork opens a new tabpage")
   assert(vim.api.nvim_win_get_buf(0) == f, "the tab shows the fork")
+  assert(#vim.api.nvim_tabpage_list_wins(0) == 1,
+    ":tab StrapsFork opens one window, got " .. #vim.api.nvim_tabpage_list_wins(0))
   vim.cmd("tabclose")
   vim.api.nvim_set_current_win(src_win)
 
@@ -602,7 +701,8 @@ end)
 it(":StrapsFork refuses on a running session, a non-session buffer and bad args", function()
   local real_notify = vim.notify
   local notes = {}
-  vim.notify = function(msg) notes[#notes + 1] = tostring(msg) end
+  local levels = {}
+  vim.notify = function(msg, level) notes[#notes + 1] = tostring(msg); levels[#notes] = level end
   local ok, err = pcall(function()
     local before = snapshot_bufs()
     vim.api.nvim_set_current_buf(vim.api.nvim_create_buf(true, false))
@@ -628,11 +728,22 @@ end
 
     vim.cmd("StrapsFork abc -- x")
     assert(#fork_bufs_since(before) == 0, "no fork on bad args")
-    assert(notes[#notes]:find("usage: :StrapsFork", 1, true), notes[#notes])
+    assert(notes[#notes]:find("usage: :[vertical|tab] StrapsFork[!] [upto] [-- instruction]", 1, true), notes[#notes])
 
     vim.cmd("StrapsFork 1 -- x")
     assert(#fork_bufs_since(before) == 0, "no fork when upto is the system block")
     assert(notes[#notes]:find("at least one message block", 1, true), notes[#notes])
+    assert(notes[#notes]:find("^straps%-divergent: upto must"), "no internal fn.fork prefix: " .. notes[#notes])
+    assert(levels[#notes] == vim.log.levels.ERROR, "errors notify at ERROR")
+
+    state.append(s, "assistant", nil, "done")
+    state.ensure_trailing_user(s)
+    vim.cmd("StrapsFork! -- y")
+    local f = fork_bufs_since(before)[1]
+    assert(f, "fork buffer expected")
+    assert(notes[#notes] == ("straps-divergent: forked into buffer %d"):format(f), notes[#notes])
+    assert(levels[#notes] == vim.log.levels.INFO, "success notifies at INFO")
+    vim.cmd("close")
   end)
   vim.notify = real_notify
   assert(ok, err)

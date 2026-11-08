@@ -37,7 +37,10 @@ transcript as input tokens.
 <
 `setup()` must run after straps' own `setup()`; it errors otherwise. The
 plugin's prompt section (`fn.system_prompt_layer.divergent`) registers after
-the straps layers, which keeps the prompt-cache prefix stable.
+the straps layers, which keeps the prompt-cache prefix stable. `setup(opts)`
+accepts an optional table with no supported keys and warns for a non-empty table.
+Non-table arguments raise an error. :checkhealth straps-divergent reports setup
+order and fork registration without creating a fork.
 
 With nixvim, import the flake's module next to the straps module:
 >nix
@@ -54,7 +57,8 @@ straps' `setup()`.
 ==============================================================================
 3. THE FORK TOOL				*straps-divergent-tool* *tool.fork*
 
-fork{ task, upto?, show?, max_turns?, timeout_ms?, model?, effort? }
+fork{ task, upto?, show?, max_turns?, timeout_ms?, model?, effort?,
+      readonly?, allow? }
 
 The agent calls it from a running session. The tool:
 
@@ -81,11 +85,18 @@ The fork is a subagent of the source: `spawn_wait{ buffers = { N } }`
 collects its final reply, the completion notice
 (|hook.on_run_end.notify_parent|) arrives when it ends, |:StrapsStop| on the
 source stops it, and it counts against `config.max_spawn_depth` (the tool
-stays listed at the limit and refuses there). It copies the source's
-permission grants wholesale, including a gated parent's ceiling and any
-|:StrapsAuto| grants (`spawn` passes only its `allow` list on), plus its
-tool filter, provider, model and effort; `model` and `effort` override the
-inherited values. Its registry scope chains under the source, so the
+stays listed at the limit and refuses there). Without `readonly` or
+`allow`, it copies the source's permission grants wholesale, including a
+gated parent's ceiling and any |:StrapsAuto| grants (`spawn` passes only its
+`allow` list on). With `readonly = true` or `allow = { ... }`, the fork gets
+only those grants, with `spawn`'s meaning: granted categories and tool names
+run without a prompt, read-only calls pass, and every other call is denied.
+`readonly` and `allow` are mutually exclusive, and a gated source can grant
+only a subset of its own grants. The fork also copies the source's tool
+filter, provider, model and effort; `model` and `effort` override the
+inherited values. The model is read from and written to the provider's own
+buffer variable (`straps_model`, `straps_openai_model`,
+`straps_llamacpp_model`). Its registry scope chains under the source, so the
 source's session-scoped entries resolve. It loses `ask_user`, as every
 subagent does.
 
@@ -104,7 +115,8 @@ trailing user block, opens the fork in a split (`:vertical` for a vsplit,
 `:tab` for a tabpage, `:botright` and the other placement modifiers as for
 |:Straps|) and starts its run. Without `!` and without `-- instruction`, it
 prompts for one. With `!`, the fork opens idle with the instruction (if any)
-in place, so you can edit it before pressing <CR>.
+in place, so you can edit it before pressing <CR>. On success the command
+notifies "straps-divergent: forked into buffer N".
 
 A command fork is a peer: it has no parent, nothing notifies the source when
 it ends, |:StrapsStop| on the source leaves it running, `ask_user` stays
@@ -126,7 +138,9 @@ fn.fork(source, opts) -> bufnr
 		`split` (a split command; the fork opens with it), `focus`
 		(false restores the previous window), `max_turns` (a child
 		defaults to 24, a peer inherits the source's cap),
-		`timeout_ms`, `provider`, `model`, `effort`.
+		`timeout_ms`, `provider`, `model`, `effort`, `readonly`,
+		`allow` (either one replaces the copied grants with that
+		grant set and a gated confirm; the caller validates them).
 
 						*fn.fork_section*
 fn.fork_section(source, child, upto, { relation, depth }) -> string
@@ -142,10 +156,10 @@ fn.system_prompt_layer.divergent()
 6. TESTS					*straps-divergent-tests*
 
 >sh
-	STRAPS_DIR=/path/to/straps busted tests/fork_spec.lua
-	STRAPS_DIR=/path/to/straps busted tests/setup_order_spec.lua
+	STRAPS_ROOT=/path/to/straps busted tests/fork_spec.lua
+	STRAPS_ROOT=/path/to/straps busted tests/setup_order_spec.lua
 <
-Without `STRAPS_DIR` the specs look for a straps checkout at `../straps`.
+Without `STRAPS_ROOT` the specs look for a straps checkout at `../straps`.
 Run one busted process per spec. `nix flake check` runs every spec against
 the straps input recorded in `flake.lock`.
 

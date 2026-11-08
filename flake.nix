@@ -73,7 +73,7 @@
           checkPhase = ''
             export HOME=$TMPDIR
             export XDG_DATA_HOME=$TMPDIR/data XDG_STATE_HOME=$TMPDIR/state XDG_CACHE_HOME=$TMPDIR/cache
-            export STRAPS_DIR=${straps}
+            export STRAPS_ROOT=${straps}
             fail=0
             for t in tests/*_spec.lua; do
               echo "== $t"
@@ -91,7 +91,7 @@
             pkgs.neovim pkgs.curl
             pkgs.luajitPackages.busted pkgs.luajitPackages.nlua
           ];
-          STRAPS_DIR = "${straps}";
+          STRAPS_ROOT = "${straps}";
         };
       });
     };

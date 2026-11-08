@@ -6,9 +6,9 @@
 
 local script = debug.getinfo(1, "S").source:sub(2)
 local root = vim.fn.fnamemodify(vim.fn.fnamemodify(script, ":p"), ":h:h")
-local straps_dir = vim.env.STRAPS_DIR or vim.fn.fnamemodify(root, ":h") .. "/straps"
+local straps_dir = vim.env.STRAPS_ROOT or vim.env.STRAPS_DIR or vim.fn.fnamemodify(root, ":h") .. "/straps"
 assert(vim.fn.isdirectory(straps_dir .. "/lua/straps") == 1,
-  "straps checkout not found at " .. straps_dir .. " (set STRAPS_DIR)")
+  "straps checkout not found at " .. straps_dir .. " (set STRAPS_ROOT)")
 vim.opt.runtimepath:prepend(straps_dir)
 vim.opt.runtimepath:prepend(root)
 package.path = straps_dir .. "/lua/?.lua;" .. straps_dir .. "/lua/?/init.lua;"
