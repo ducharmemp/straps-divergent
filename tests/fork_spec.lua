@@ -120,6 +120,186 @@ end
 
 -- --------------------------------------------------------------- registration
 
+do
+local assertion = 0
+local check = assert
+local function assert(condition, message)
+  assertion = assertion + 1
+  if tonumber(os.getenv("STRAPS_FORK_ARCHIVE_COUNTERFACTUAL")) == assertion then condition = not condition end
+  return check(condition, message or ("fork archive assertion " .. assertion))
+end
+
+local function summary_receipt(id)
+  return "Assistant summary of archived assistant claims and tool evidence [straps-context:" .. id .. "]\nsummary"
+end
+
+local function with_archive(module, run)
+  local saved = package.loaded["straps.context_archive"]
+  package.loaded["straps.context_archive"] = module
+  local ok, err = pcall(run)
+  package.loaded["straps.context_archive"] = saved
+  assert(ok, err)
+end
+
+it("literal archive examples fork without archive APIs even when context management is disabled", function()
+  with_archive({}, function()
+    for _, relation in ipairs({ "child", "peer" }) do
+      local s = mid_turn_source()
+      vim.b[s].straps_context_management = { enabled = false }
+      state.append(s, "system", nil, "Documentation [straps-context:id]")
+      state.append(s, "assistant", nil, "[straps-context:" .. string.rep("a", 32) .. "]")
+      state.append(s, "user", nil, summary_receipt(string.rep("a", 32)))
+      state.append(s, "tool_result", { id = "docs" }, "Examples:\n" .. summary_receipt(string.rep("a", 32)))
+      local child = registry.call("fn.fork", s, { relation = relation, task = "legacy", start = false })
+      assert(vim.api.nvim_buf_is_valid(child), "literal examples leave ordinary forks available")
+    end
+  end)
+end)
+
+it("context archive inheritance receives the copied cutoff for children and peers", function()
+  local calls = {}
+  with_archive({ referenced = function() return { "copied" } end, inherit = function(source, child, cutoff)
+    calls[#calls + 1] = { source, child, cutoff, text_of(child) }
+    return true
+  end }, function()
+    local s = mid_turn_source()
+    state.append(s, "assistant", nil, summary_receipt("copied"))
+    local cutoff = #state.list_blocks(s)
+    state.append(s, "assistant", nil, summary_receipt("excluded"))
+    for _, relation in ipairs({ "child", "peer" }) do
+      local child = registry.call("fn.fork", s, { relation = relation, upto = cutoff, task = "t", start = false })
+      local call = calls[#calls]
+      assert(call[1] == s and call[2] == child and call[3] == cutoff, "inherit receives source, fork, and exact block cutoff")
+      assert(call[4]:find("[straps-context:copied]", 1, true), "inherit sees the copied receipt")
+      assert(not call[4]:find("[straps-context:excluded]", 1, true), "inherit never sees content after cutoff")
+    end
+    assert(#calls == 2, "both child and peer forks inherit")
+    local child = registry.call("fn.fork", s, { upto = cutoff - 1, task = "before receipt", start = false })
+    assert(#calls == 2 and not text_of(child):find("[straps-context:", 1, true), "cut before all receipts skips archive API")
+  end)
+end)
+
+it("context archive incompatibility refuses structured receipts before allocating a fork", function()
+  with_archive({}, function()
+    local s = mid_turn_source()
+    state.append(s, "assistant", nil, summary_receipt("unknown"))
+    local before = #vim.api.nvim_list_bufs()
+    local ok, err = pcall(registry.call, "fn.fork", s, { task = "t", start = false })
+    assert(not ok and tostring(err):find("compatible straps.context_archive.referenced and inherit APIs", 1, true), "incompatible archive API gives an actionable error")
+    assert(#vim.api.nvim_list_bufs() == before, "incompatible archive API creates no fork")
+  end)
+end)
+
+it("context archive inheritance failure cleans the fork without starting it", function()
+  for _, failure in ipairs({ "return", "throw" }) do
+    local child, path
+    with_archive({ referenced = function() return { "pasted" } end, inherit = function(_, fork)
+      child = fork
+      path = vim.api.nvim_buf_get_name(fork)
+      if failure == "throw" then error("unauthorized receipt") end
+      return nil, "unauthorized receipt"
+    end }, function()
+      local s = mid_turn_source()
+      state.append(s, "assistant", nil, summary_receipt("pasted"))
+      local original = text_of(s)
+      local ok, err = pcall(registry.call, "fn.fork", s, { task = "t" })
+      assert(not ok and tostring(err):find("unauthorized receipt", 1, true), "archive rejection reaches the caller")
+      assert(child and not vim.api.nvim_buf_is_valid(child), "rejected fork buffer is deleted")
+      assert(vim.fn.filereadable(path) == 0, "rejected fork transcript is removed")
+      assert(not loop.running(child), "rejected fork never starts")
+      assert(text_of(s) == original, "archive failure leaves the source unchanged")
+    end)
+  end
+end)
+
+it("child and peer forks copy session context management overrides independently", function()
+  local management = require("straps.context_management")
+  for _, enabled in ipairs({ true, false }) do
+    local s = mid_turn_source()
+    local source = { enabled = enabled, mode = "summary", summary = { max_output_tokens = 71 } }
+    vim.b[s].straps_context_management = source
+    local forks = {}
+    for _, relation in ipairs({ "child", "peer" }) do
+      local child = registry.call("fn.fork", s, { relation = relation, task = "t", start = false })
+      forks[#forks + 1] = child
+      assert(vim.deep_equal(vim.b[child].straps_context_management, source), "fork inherits the complete per-session override")
+      assert(management.enabled(child) == enabled, "fork retains source opt-in policy")
+    end
+    local changed = vim.b[forks[1]].straps_context_management
+    changed.summary.max_output_tokens = 99
+    vim.b[forks[1]].straps_context_management = changed
+    assert(vim.b[s].straps_context_management.summary.max_output_tokens == 71, "child mutation preserves source override")
+    assert(vim.b[forks[2]].straps_context_management.summary.max_output_tokens == 71, "child mutation preserves peer override")
+  end
+end)
+
+it("trusted context archives survive restricted child and peer forks with nested descendants", function()
+  local archive = require("straps.context_archive")
+  local s = mid_turn_source()
+  vim.b[s].straps_context_management = { enabled = false }
+  local leaf = assert(archive.create(s, { sources = { { kind = "tool_result", text = "nested-original" } } }))
+  local root_id = assert(archive.create(s, { sources = { { kind = "assistant", text = "root-original" } },
+    children = { leaf }, summary = "root summary" }))
+  state.append(s, "assistant", nil, summary_receipt(root_id))
+  local cutoff = #state.list_blocks(s)
+  local excluded = assert(archive.create(s, { sources = { { kind = "tool_result", text = "excluded-original" } } }))
+  state.append(s, "assistant", nil, summary_receipt(excluded))
+  for _, relation in ipairs({ "child", "peer" }) do
+    local child = registry.call("fn.fork", s, { relation = relation, readonly = true, upto = cutoff, task = "t", start = false })
+    local record = assert(archive.get(child, root_id))
+    assert(record.summary == "root summary", "restricted fork receives its copied summary")
+    local descendant = assert(archive.get(child, leaf))
+    assert(descendant.sources[1].text == "nested-original", "restricted fork receives authorized nested sources")
+    assert(archive.get(child, excluded) == nil, "fork cannot recover an archive beyond its cutoff")
+    local prev = registry.set_active_scope(child)
+    local allowed = registry.call("hook.confirm", "read_file", { path = "/tmp/x" }, { bufnr = child })
+    local denied = registry.call("hook.confirm", "write_file", { path = "/tmp/x", content = "" }, { bufnr = child })
+    registry.set_active_scope(prev)
+    assert(allowed == true and denied == false, "archive inheritance preserves restricted tool permissions")
+  end
+end)
+
+it("trusted context archive grants survive source closure and fork reopen", function()
+  local archive = require("straps.context_archive")
+  local s = mid_turn_source()
+  local id = assert(archive.create(s, { sources = { { kind = "tool_result", text = "durable-original" } } }))
+  state.append(s, "assistant", nil, summary_receipt(id))
+  local forks = {}
+  for _, relation in ipairs({ "child", "peer" }) do
+    local child = registry.call("fn.fork", s, { relation = relation, task = "t", start = false })
+    state.persist(child)
+    forks[#forks + 1] = { child = child, path = vim.api.nvim_buf_get_name(child) }
+  end
+  vim.api.nvim_buf_delete(s, { force = true })
+  for _, fork in ipairs(forks) do
+    local record = assert(archive.get(fork.child, id))
+    assert(record.sources[1].text == "durable-original", "fork reads evidence after source closure")
+    vim.api.nvim_buf_delete(fork.child, { force = true })
+    local reopened = state.open_session_file(fork.path)
+    local restored = assert(archive.get(reopened, id))
+    assert(restored.sources[1].text == "durable-original", "reopened fork restores trusted archive grants")
+  end
+end)
+
+it("unknown and pasted context archive IDs cannot authorize child or peer forks", function()
+  local archive = require("straps.context_archive")
+  local owner = mid_turn_source()
+  local id = assert(archive.create(owner, { sources = { { kind = "tool_result", text = "private-original" } } }))
+  for _, receipt_id in ipairs({ id, string.rep("0", 32) }) do
+    for _, relation in ipairs({ "child", "peer" }) do
+      local s = mid_turn_source()
+      state.append(s, "assistant", nil, summary_receipt(receipt_id))
+      local original = text_of(s)
+      local before = #vim.api.nvim_list_bufs()
+      local ok, err = pcall(registry.call, "fn.fork", s, { relation = relation, task = "t", start = false })
+      assert(not ok and tostring(err):find("context archive inheritance failed", 1, true), "unknown or pasted receipt refuses fork")
+      assert(#vim.api.nvim_list_bufs() == before, "unauthorized receipt leaves no fork buffer")
+      assert(text_of(s) == original, "unauthorized receipt refusal preserves source transcript")
+    end
+  end
+end)
+end
+
 it("setup registers the entries and the command", function()
   for _, name in ipairs({ "fn.fork", "fn.fork_section", "tool.fork", "fn.system_prompt_layer.divergent" }) do
     assert(registry.get(name), name .. " should be registered")
@@ -493,6 +673,91 @@ it("tool.fork with allow or readonly gates the fork instead of copying grants", 
     return registry.call("tool.fork", { task = "x", allow = { "exec" } }, ctx)
   end)
   assert(not ok and tostring(err):find("exceeds this session's own grants", 1, true), tostring(err))
+end)
+
+it("a readonly fork watches unrelated sessions and removes only its own subscription", function()
+  local parent = mid_turn_source()
+  local target = state.new_session()
+  local other = state.new_session()
+  registry.call("tool.watch_agent", { to = tostring(target), wake = false }, { bufnr = other })
+  local child = registry.call("fn.fork", parent, { task = "watch", readonly = true, start = false })
+  assert(registry.granted(child)["spawn:gated"] == true, "fork must retain its permission gate")
+  assert(registry.granted(child)["cap:spawn"] == nil, "watching must not require a spawn grant")
+  provider(([[
+return function(_, ctx)
+  local n = (vim.b[ctx.bufnr].watch_test_step or 0) + 1
+  vim.b[ctx.bufnr].watch_test_step = n
+  if n == 1 or n == 3 then
+    return { stop_reason = "tool_use", content = {
+      { type = "tool_use", id = "watch-" .. n,
+        name = n == 1 and "watch_agent" or "unwatch_agent", input = { to = "%d" } } } }
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "watch-done" } } }
+end
+]]):format(target))
+  loop.start(child)
+  wait_idle(child)
+  local watched = result_of(state.parse(child), "watch-1")
+  assert(watched and not watched.is_error, "readonly fork watch call must pass its gate and tool body")
+  local subscriptions = vim.b[target].straps_watchers or {}
+  assert(subscriptions[tostring(child)] ~= nil, "readonly fork must store a watch on an unrelated session")
+  assert(subscriptions[tostring(child)].wake == true, "readonly fork watch must permit default automatic wake")
+  assert(subscriptions[tostring(other)] ~= nil, "fork watch must preserve another watcher's subscription")
+  state.append_text(child, "unwatch")
+  loop.start(child)
+  wait_idle(child)
+  local unwatched = result_of(state.parse(child), "watch-3")
+  assert(unwatched and not unwatched.is_error, "readonly fork unwatch call must pass its gate and tool body")
+  subscriptions = vim.b[target].straps_watchers or {}
+  assert(subscriptions[tostring(child)] == nil, "unwatch must remove the caller's subscription")
+  assert(subscriptions[tostring(other)] ~= nil and subscriptions[tostring(other)].wake == false,
+    "unwatch must preserve another watcher's subscription and wake setting")
+  local prev = registry.set_active_scope(child)
+  local to_parent = registry.call("hook.confirm", "send_message", { to = "parent" }, { bufnr = child })
+  local to_target = registry.call("hook.confirm", "send_message", { to = tostring(target) }, { bufnr = child })
+  registry.set_active_scope(prev)
+  assert(to_parent == true, "parent messaging must retain its grant-free exception")
+  assert(to_target == false, "watch exceptions must not grant unrelated messaging")
+  registry.call("tool.watch_agent", { to = tostring(target) }, { bufnr = child })
+  provider(([[
+return function(req, ctx)
+  if ctx.bufnr == %d then
+    vim.b[ctx.bufnr].watch_wake_request = vim.inspect(req.messages)
+  end
+  return { stop_reason = "end_turn", content = { { type = "text", text = "event-done" } } }
+end
+]]):format(child))
+  state.append_text(target, "trigger watched event")
+  loop.start(target)
+  wait_idle(target)
+  assert(vim.wait(10000, function() return vim.b[child].watch_wake_request ~= nil end, 10),
+    "unrelated session event must start the idle readonly fork")
+  wait_idle(child)
+  assert(vim.b[child].watch_wake_request:find("[straps] watched agent", 1, true)
+    and vim.b[child].watch_wake_request:find("run_end (ok)", 1, true),
+    "the readonly fork's waking provider request must contain the unrelated event notice")
+end)
+
+it("a readonly fork denies inherited scoped watch and unwatch replacements", function()
+  local parent = mid_turn_source()
+  for _, name in ipairs({ "watch_agent", "unwatch_agent" }) do
+    registry.define({ name = "tool." .. name, kind = "tool", source = "return function() return 'replacement' end" },
+      { scope = parent })
+  end
+  local child = registry.call("fn.fork", parent, { task = "readonly replacements", readonly = true, start = false })
+  local previous = registry.set_active_scope(child)
+  local ok, err = pcall(function()
+    for _, name in ipairs({ "watch_agent", "unwatch_agent" }) do
+      local input = { to = tostring(parent) }
+      assert(registry.get("tool." .. name).scope == parent and registry.call("fn.capability", name, input) == "agent_tool",
+        name .. " replacement must resolve from the parent and classify as agent_tool")
+      local allowed, reason = registry.call("hook.confirm", name, input, { bufnr = child })
+      assert(allowed == false and tostring(reason):find("readonly subagent", 1, true),
+        name .. " inherited replacement must be denied by the readonly fork gate")
+    end
+  end)
+  registry.set_active_scope(previous)
+  if not ok then error(err) end
 end)
 
 it("an upto cut never claims a fork call, and a mid-transcript orphan is left alone", function()

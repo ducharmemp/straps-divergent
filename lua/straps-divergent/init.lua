@@ -1,7 +1,24 @@
 local M = {}
+local contextual_originals = {}
+
+function M.install_contextual(consumer)
+  local registry = require("straps.registry")
+  assert(registry.trusted_setup_allowed(), "divergent attestation requires trusted setup")
+  assert(type(consumer) == "function", "divergent attestation consumer required")
+  consumer(function()
+    local result = {}
+    for name, original in pairs(contextual_originals) do
+      local entry = registry.get(name)
+      if not entry or entry.identity ~= original.identity or entry.source ~= original.source then return nil end
+      result[name] = { identity = entry.identity, source = entry.source, scope = entry.scope }
+    end
+    if not result["tool.fork"] or not result["fn.system_prompt_layer.divergent"] then return nil end
+    return result
+  end)
+end
 
 local FORK_SRC = [==[
-return function(source, opts)
+local function fork(source, opts, transaction)
   opts = opts or {}
   local registry = require("straps.registry")
   local state = require("straps.state")
@@ -49,14 +66,71 @@ return function(source, opts)
     end
   end
   local lines = vim.api.nvim_buf_get_lines(source, 0, blocks[upto].last_lnum, false)
+  local archive
+  local has_receipt = false
+  for i = 1, upto do
+    local b = blocks[i]
+    local first = vim.api.nvim_buf_get_lines(source, b.first_lnum - 1, b.first_lnum, false)[1] or ""
+    if (b.kind == "tool_result" and first:match("^%[straps%-context:[^%]]+%] archived tool evidence; tool=.-; bytes=%d+$"))
+      or (b.kind == "assistant" and first:match("^Assistant summary of archived assistant claims and tool evidence %[straps%-context:[^%]]+%]$")) then
+      has_receipt = true
+      break
+    end
+  end
+  if has_receipt then
+    local ok, module = pcall(require, "straps.context_archive")
+    if not ok or type(module) ~= "table" or type(module.referenced) ~= "function" or type(module.inherit) ~= "function" then
+      error("fn.fork: copied context archive references require compatible straps.context_archive.referenced and inherit APIs", 0)
+    end
+    local refs, err = module.referenced(source, upto)
+    if not refs then error("fn.fork: context archive inheritance failed: " .. tostring(err), 0) end
+    if #refs > 0 then archive = module end
+  end
 
   local depth = 0
   pcall(function() depth = tonumber(vim.b[source].straps_spawn_depth) or 0 end)
   local child_depth = relation == "child" and (depth + 1) or depth
 
-  local child = state.new_session()
+  local gated = opts.readonly or type(opts.allow) == "table"
+  local may_spawn = not gated
+  for _, grant in ipairs(type(opts.allow) == "table" and opts.allow or {}) do
+    if grant == "spawn" then may_spawn = true end
+  end
+  local filter = vim.b[source].straps_tool_filter
+  local prompt_options = {
+    subagent = relation == "child" or nil,
+    can_spawn = (child_depth < (registry.try_call("fn.spawn_depth_limit") or 1) and may_spawn) or nil,
+    readonly = (opts.readonly or (type(opts.allow) == "table" and #opts.allow == 0)) and true or nil,
+    tools = type(filter) == "table" and #filter > 0 and filter or nil,
+  }
+  local child = transaction and transaction.construct(prompt_options,
+    { source = source, upto = upto, relation = relation, depth = child_depth }) or state.new_session()
   registry.ensure_scope(child, source)
+  local context_management = vim.b[source].straps_context_management
+  if type(context_management) == "table" then
+    vim.b[child].straps_context_management = vim.deepcopy(context_management)
+  end
   vim.api.nvim_buf_set_lines(child, 0, -1, false, lines)
+  if archive then
+    local ok, inherited, err = pcall(archive.inherit, source, child, upto)
+    if not ok or inherited ~= true then
+      local path = vim.api.nvim_buf_get_name(child)
+      local file_backed = vim.bo[child].buftype == ""
+      local cleaned, cleanup_err = pcall(vim.api.nvim_buf_delete, child, { force = true })
+      if file_backed then
+        for _, suffix in ipairs({ "", ".meta" }) do
+          local target = path .. suffix
+          if vim.fn.filereadable(target) == 1 and vim.fn.delete(target) ~= 0 then
+            cleaned = false
+            cleanup_err = "could not remove " .. target
+          end
+        end
+      end
+      local reason = ok and (err or "archive inheritance did not succeed") or inherited
+      error("fn.fork: context archive inheritance failed: " .. tostring(reason)
+        .. (cleaned and "" or ("; fork cleanup failed: " .. tostring(cleanup_err))), 0)
+    end
+  end
 
   local cblocks = state.list_blocks(child)
   local sys = cblocks[1]
@@ -184,8 +258,8 @@ return function(source, opts)
     registry.define({
       name = "hook.confirm",
       kind = "hook",
-      doc = "fork: readonly/allow child — auto-allow read-only calls plus the"
-        .. " granted categories/tools, deny everything else without a prompt.",
+      doc = "fork: readonly/allow child — allow reads, watch/unwatch on any session,"
+        .. " parent messaging and granted categories/tools; deny every other call without a prompt.",
       source = require("straps-divergent").GATED_CONFIRM_SRC,
     }, { scope = child })
   else
@@ -205,10 +279,14 @@ return function(source, opts)
       pcall(vim.api.nvim_set_current_win, prev)
     end
   end
-  if start then
+  if transaction then transaction.attach(child) end
+  if start and (not transaction or transaction.start) then
     loop.start(child)
   end
   return child
+end
+return function(source, opts)
+  return require("straps.contextual_children").fork(source, opts or {}, fork)
 end
 ]==]
 
@@ -225,6 +303,7 @@ return function(name, tin, tctx)
     if cap and allowed["cap:" .. tostring(cap)] then return true end
     if allowed[reg.tool_grant_key(name)] then return true end
   end
+  if cap == "spawn" and (name == "watch_agent" or name == "unwatch_agent") then return true end
   if name == "send_message" and type(tin) == "table" and tin.to == "parent" then
     return true
   end
@@ -335,9 +414,10 @@ return function(input, ctx)
     return "fork: refused — subagent depth limit (" .. max_depth
       .. ") reached; do this work yourself"
   end
-  local child = registry.call("fn.fork", ctx.bufnr, {
+  local child, status = registry.call("fn.fork", ctx.bufnr, {
     relation = "child",
     task = task,
+    delegation = input.delegation,
     upto = input.upto,
     max_turns = input.max_turns,
     timeout_ms = input.timeout_ms,
@@ -350,6 +430,10 @@ return function(input, ctx)
   })
   local name = vim.api.nvim_buf_get_name(child)
   local where = name ~= "" and vim.fn.fnamemodify(name, ":~:.") or ("buffer " .. child)
+  if status == "adoption_required" then
+    return ("fork created inactive — buffer %d, transcript: %s\n"
+      .. "copied conversation grants no task authority; explicit human adoption is required before start"):format(child, where)
+  end
   return ("fork started — buffer %d, transcript: %s\n"
     .. "it holds a copy of this conversation plus your task; collect its answer with"
     .. " spawn_wait{ buffers = { %d } }"):format(child, where, child)
@@ -370,7 +454,10 @@ return function()
   it earlier); tool calls after that point in this session run only here.
   fork stays listed at the subagent depth limit and refuses there.
 - The user can fork a session by hand with :StrapsFork; such a fork is a peer
-  and sends you no notice.]]
+  and sends you no notice.
+- In contextual mode, generic human fork invocation is unavailable. An admitted
+  agent fork creates an inactive copy requiring explicit human adoption before
+  start; explicit task delegation refuses without a trusted prompt receipt.]]
 end
 ]==]
 
@@ -455,7 +542,15 @@ function M.register()
   if registry.get("fn.system_prompt") == nil then
     error("straps-divergent: call require(\"straps\").setup() before require(\"straps-divergent\").setup()", 0)
   end
-  local define = registry.define_default
+  local function define(spec)
+    local absent = registry.get(spec.name) == nil
+    local entry = registry.define_default(spec)
+    if absent and (spec.name == "tool.fork" or spec.name == "fn.fork" or spec.name == "fn.fork_section"
+        or spec.name == "fn.system_prompt_layer.divergent") then
+      contextual_originals[spec.name] = { identity = entry.identity, source = entry.source }
+    end
+    return entry
+  end
 
   define({
     name = "fn.fork",
@@ -471,7 +566,10 @@ function M.register()
       .. " plus its tool filter and provider/model/effort (opts.provider/model/effort override),"
       .. " and chains the fork's registry scope under the source. opts.start = false"
       .. " leaves the fork idle; opts.split opens it with that split command (focus ="
-      .. " false restores the previous window); max_turns, timeout_ms as for spawn.",
+      .. " false restores the previous window); max_turns, timeout_ms as for spawn."
+      .. " Contextual mode refuses generic human invocation. Exact agent calls create"
+      .. " an inactive copied session requiring human adoption before start; explicit"
+      .. " delegation refuses because copied prompts have no trusted receipt.",
     source = FORK_SRC,
   })
 
@@ -510,25 +608,31 @@ function M.register()
       .. " show (optional): open the fork's transcript in a split; max_turns (default"
       .. " 24); timeout_ms (default 600000, enforced by spawn_wait); model, effort"
       .. " (optional): override the inherited model/effort; readonly (optional boolean):"
-      .. " the fork may use only read-only tools, every write is denied without a prompt"
+      .. " the fork permits read-only tools plus watch_agent/unwatch_agent on any session"
+      .. " (including automatic wake; unwatch removes only its own subscription) and"
+      .. " send_message{to=\"parent\"}, every other write is denied without a prompt"
       .. " (equivalent to allow={}); allow (optional array): grant only these permission"
-      .. " categories or tool names, everything else is denied; readonly and allow are"
-      .. " mutually exclusive, and a gated session can grant only a subset of its own grants.",
+      .. " categories or tool names in addition to those exceptions; readonly and allow are"
+      .. " mutually exclusive, and a gated session can grant only a subset of its own grants."
+      .. " In contextual mode, an admitted agent fork creates an inactive copy requiring"
+      .. " explicit human adoption before start. Explicit task delegation refuses for"
+      .. " copied prompts without a trusted receipt.",
     input_schema = {
       type = "object",
       properties = {
         task = { type = "string", description = "The fork's instruction; it may refer to anything in this conversation." },
+        delegation = require("straps.contextual_children").delegation_schema(),
         upto = { type = "integer", minimum = 2, description = "Copy blocks 1..upto only (block numbers as transcript_excise lists them; 2 or more); default: the whole transcript." },
         show = { type = "boolean", description = "Open the fork's transcript buffer in a split." },
         max_turns = { type = "integer", description = "Fork turn budget (default 24)." },
         timeout_ms = { type = "integer", description = "Wall-clock cap in milliseconds (default 600000), enforced by spawn_wait." },
         model = { type = "string", description = "Model id for the fork (default: this session's model)." },
         effort = { type = "string", description = "Extended-thinking effort name for the fork (default: this session's effort)." },
-        readonly = { type = "boolean", description = "Read-only fork: every write tool is denied. Default: the fork copies this session's grants." },
+        readonly = { type = "boolean", description = "Allow reads, watch/unwatch on any session and parent messaging; deny other writes. Default: copy this session's grants." },
         allow = {
           type = "array",
           items = { type = "string" },
-          description = "Grant only these permission categories (edit, delete, exec, lua, net, spawn) or tool names to the fork: granted calls run without prompting; everything else is DENIED. readonly=true is equivalent to allow={}.",
+          description = "Grant only these permission categories (edit, delete, exec, lua, net, spawn) or tool names to the fork: granted calls, reads, builtin watch/unwatch on any session and parent messaging run without prompting; other calls are denied. readonly=true is equivalent to allow={}.",
         },
       },
       required = { "task" },
@@ -543,6 +647,13 @@ function M.register()
       .. " fork's transcript is cut, and that :StrapsFork makes a peer.",
     source = PROMPT_LAYER_SRC,
   })
+
+  if registry.trusted_setup_allowed() then
+    local provider = require("straps.provider")
+    if type(provider.install_divergent) == "function" then provider.install_divergent() end
+    local contextual = require("straps.contextual")
+    if type(contextual.install_divergent) == "function" then contextual.install_divergent() end
+  end
 
   vim.api.nvim_create_user_command("StrapsFork", fork_command, {
     nargs = "*",

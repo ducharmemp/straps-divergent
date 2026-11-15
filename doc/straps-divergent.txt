@@ -19,7 +19,8 @@ CONTENTS					*straps-divergent*
 A fork is a new straps session whose transcript is a verbatim copy of a
 source session's transcript, cut after a chosen block, with a
 `# You are a fork` section appended to the copied system block and one new
-user instruction at the end. The fork runs in parallel with the source.
+user instruction at the end. In strict mode, the fork runs in parallel with
+its source. Contextual mode has the restrictions below.
 
 `spawn` (|straps-subagents|) starts a child with an empty context. `fork`
 starts a child that already holds this conversation: the files read, the
@@ -57,8 +58,17 @@ straps' `setup()`.
 ==============================================================================
 3. THE FORK TOOL				*straps-divergent-tool* *tool.fork*
 
+With contextual authorization enabled, generic human :StrapsFork/fn.fork
+invocations refuse because they lack a trusted exact-call context. An admitted
+agent fork without delegation creates an inactive child requiring human
+:StrapsAdopt before starting. Explicit task delegation refuses because the copied
+prompt has no valid private construction receipt. Copied conversation, permission
+grants, and archive access confer no task authority. Independent readonly/allow
+ceilings and other guards still apply. The execution descriptions below apply to
+strict mode; contextual mode retains copying subject to these restrictions.
+
 fork{ task, upto?, show?, max_turns?, timeout_ms?, model?, effort?,
-      readonly?, allow? }
+      readonly?, allow?, delegation? }
 
 The agent calls it from a running session. The tool:
 
@@ -90,7 +100,10 @@ stays listed at the limit and refuses there). Without `readonly` or
 gated parent's ceiling and any |:StrapsAuto| grants (`spawn` passes only its
 `allow` list on). With `readonly = true` or `allow = { ... }`, the fork gets
 only those grants, with `spawn`'s meaning: granted categories and tool names
-run without a prompt, read-only calls pass, and every other call is denied.
+run without a prompt and read-only calls pass. Restricted forks may watch any
+session, including automatic wake, and remove only their own watch subscriptions
+without a grant. `send_message{to="parent"}` also passes without a grant. Every
+other call is denied.
 `readonly` and `allow` are mutually exclusive, and a gated source can grant
 only a subset of its own grants. The fork also copies the source's tool
 filter, provider, model and effort; `model` and `effort` override the
@@ -99,6 +112,20 @@ buffer variable (`straps_model`, `straps_openai_model`,
 `straps_llamacpp_model`). Its registry scope chains under the source, so the
 source's session-scoped entries resolve. It loses `ask_user`, as every
 subagent does.
+
+Straps context management is opt-in and disabled by default. Forks without
+`[straps-context:<id>]` receipts keep the existing behavior without requiring
+an archive API. For copied receipts, child and peer forks call core's
+`require("straps.context_archive").inherit(source, child, upto)`. Core transfers
+trusted access only for authorized receipts through the copied block cutoff,
+including summary descendants. Pasted IDs grant no access. Restricted forks
+retain archive authorization and read-tool permission checks. Core persists
+inherited grants so recovery survives closing the source buffer and reopening
+the fork.
+
+Missing archive API support or rejected inheritance refuses a receipt-bearing
+fork before it starts. Inheritance failure removes the new fork buffer and
+transcript. Cleanup failures appear in the error.
 
 `tool.fork` carries `capability = "spawn"`, so the `spawn` grant
 (|straps-auto|) covers it.
