@@ -29,11 +29,11 @@
         ]
       },
       "locked": {
-        "lastModified": 1794111130,
-        "narHash": "sha256-ycxQ06iSy1Y8NXbIk6jwn2IbQcvyJwbYw/pYbDOTwgY=",
+        "lastModified": 1794970574,
+        "narHash": "sha256-j6y8YjRAR4cri/VtY/kXExnnGyE029zDU2p6s5HsDVw=",
         "owner": "ducharmemp",
         "repo": "straps",
-        "rev": "f2ebdb227917f51a4fc68479015a9a9e1787f00b",
+        "rev": "c16e7d31ddafac8446b339b35b50e2de1e5fdffb",
         "type": "github"
       },
       "original": {
